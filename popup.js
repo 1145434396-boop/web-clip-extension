@@ -63,6 +63,11 @@ async function extractOther() {
             else lines.push(txt);
             lines.push('');
           }
+          // 补捞包在 span 等非块级元素里的图片（否则会被当叶子丢掉）
+          for (const im of node.querySelectorAll('img')) {
+            const isrc = (im.getAttribute('data-src') || im.src || '').trim();
+            if (isrc && isrc.startsWith('http')) { lines.push(`![](${isrc})`); lines.push(''); images[isrc] = null; }
+          }
           return;
         }
       }
@@ -104,13 +109,55 @@ async function extractOther() {
     content = body + (gallery.length ? '\n\n' + gallery.join('\n\n') : '');
 
   } else {
+    // 1) 滚动到底触发懒加载图片，再回到顶部
+    const _sh = document.body.scrollHeight;
+    for (let p = 0; p <= _sh; p += 600) { window.scrollTo(0, p); await new Promise(r => setTimeout(r, 200)); }
+    window.scrollTo(0, 0);
+    await new Promise(r => setTimeout(r, 500));
+
+    // 2) 代理 URL（如 Next.js 的 /_next/image?url=ENCODED）解码成真实原图
+    const resolveUrl = (u) => {
+      if (!u) return '';
+      const m = u.match(/\/_next\/image\?url=([^&]+)/);
+      if (m) { try { return decodeURIComponent(m[1]); } catch {} }
+      return u;
+    };
+    // 3) 把懒加载 / srcset / 代理的真实地址写回 img.src，让 Readability 能保留、md 链接正确
+    for (const img of document.querySelectorAll('img')) {
+      let u = img.currentSrc || img.getAttribute('src') || img.getAttribute('data-src') || '';
+      if ((!u || u.startsWith('data:')) && img.getAttribute('srcset')) {
+        const cands = img.getAttribute('srcset').split(',').map(s => s.trim().split(/\s+/)[0]).filter(Boolean);
+        if (cands.length) u = cands[cands.length - 1];  // srcset 取最后（通常最大）
+      }
+      u = resolveUrl(u);
+      if (u && u.startsWith('http')) img.setAttribute('src', u);
+    }
+
+    // 4) 记录「文章首图」候选（DOM 中第一张大图，排除导航/页脚）——Readability 常把正文主体外的首图裁掉
+    let leadUrl = '';
+    for (const img of document.querySelectorAll('img')) {
+      if (img.closest('nav, footer')) continue;
+      const w = img.naturalWidth || parseInt(img.getAttribute('width')) || 0;
+      const h = img.naturalHeight || parseInt(img.getAttribute('height')) || 0;
+      if (w >= 400 || h >= 400) {
+        const u = resolveUrl(img.currentSrc || img.getAttribute('src') || '');
+        if (u && u.startsWith('http')) { leadUrl = u; break; }
+      }
+    }
+
     const article = new Readability(document.cloneNode(true)).parse();
     if (!article) return null;
     const td = new TurndownService({ headingStyle:'atx', codeBlockStyle:'fenced' });
-    const imgUrls = [...new Set([...article.content.matchAll(/<img[^>]+src="([^"]+)"/g)].map(m=>m[1]))].filter(u=>u.startsWith('http'));
+    const imgUrls = [...new Set([...article.content.matchAll(/<img[^>]+src="([^"]+)"/g)].map(m => resolveUrl(m[1])))].filter(u => u.startsWith('http'));
     for (const url of imgUrls) { const data = await fetchImg(url); if (data) images[url] = data; }
     content = td.turndown(article.content);
     title = (article.title || document.title || '').replace(INVISIBLE, '').trim();
+
+    // 首图若未被正文收录，补到正文开头
+    if (leadUrl && !imgUrls.includes(leadUrl)) {
+      const data = await fetchImg(leadUrl);
+      if (data) { images[leadUrl] = data; content = `![](${leadUrl})\n\n` + content; }
+    }
   }
   return { title: title || '\u65e0\u6807\u9898', content, images };
 }
